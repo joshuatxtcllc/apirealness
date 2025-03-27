@@ -1,0 +1,343 @@
+// netlify/functions/api-keymaster.js
+// Serverless function for API Keymaster on Netlify
+
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const cookie = require('cookie');
+
+// Initialize Netlify KV Store
+const { createClient } = require('@netlify/functions');
+
+// Encryption helpers
+const ALGORITHM = 'aes-256-gcm';
+
+// Generate a key from password
+function deriveKey(password, salt) {
+  return crypto.scryptSync(password, salt, 32);
+}
+
+// Encrypt data
+function encrypt(data, password, salt) {
+  const key = deriveKey(password, salt);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  
+  let encrypted = cipher.update(JSON.stringify(data), 'utf8');
+  encrypted = Buffer.concat([encrypted, cipher.final()]);
+  
+  const authTag = cipher.getAuthTag();
+  
+  return Buffer.concat([iv, authTag, encrypted]).toString('base64');
+}
+
+// Decrypt data
+function decrypt(encryptedData, password, salt) {
+  const key = deriveKey(password, salt);
+  const data = Buffer.from(encryptedData, 'base64');
+  
+  const iv = data.slice(0, 16);
+  const authTag = data.slice(16, 32);
+  const encryptedText = data.slice(32);
+  
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(authTag);
+  
+  let decrypted = decipher.update(encryptedText, null, 'utf8');
+  decrypted += decipher.final('utf8');
+  
+  return JSON.parse(decrypted);
+}
+
+// Generate a JWT
+function generateToken(userId) {
+  return jwt.sign(
+    { sub: userId },
+    process.env.JWT_SECRET || 'api-keymaster-dev-secret',
+    { expiresIn: '1h' }
+  );
+}
+
+// Verify JWT
+function verifyToken(token) {
+  try {
+    return jwt.verify(
+      token,
+      process.env.JWT_SECRET || 'api-keymaster-dev-secret'
+    );
+  } catch (err) {
+    return null;
+  }
+}
+
+// Get authenticated user from request
+function getAuthUser(event) {
+  const cookies = cookie.parse(event.headers.cookie || '');
+  const token = cookies.token || event.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return null;
+  }
+  
+  return verifyToken(token);
+}
+
+exports.handler = async (event, context) => {
+  // Initialize KV Store client
+  const client = createClient(context);
+  const kvStore = client.getKVStore();
+  
+  // CORS headers
+  const headers = {
+    'Access-Control-Allow-Origin': event.headers.origin || '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Credentials': 'true',
+    'Content-Type': 'application/json'
+  };
+  
+  // Handle preflight requests
+  if (event.httpMethod === 'OPTIONS') {
+    return {
+      statusCode: 204,
+      headers
+    };
+  }
+  
+  // Parse the path and get endpoint
+  const path = event.path.replace('/.netlify/functions/api-keymaster', '').replace('/api', '');
+  const endpoint = path.split('/').filter(Boolean)[0];
+  
+  try {
+    // Handle different endpoints
+    switch (endpoint) {
+      case 'login': {
+        if (event.httpMethod !== 'POST') {
+          return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }), headers };
+        }
+        
+        const { username, masterPassword } = JSON.parse(event.body);
+        
+        if (!username || !masterPassword) {
+          return { statusCode: 400, body: JSON.stringify({ error: 'Username and master password required' }), headers };
+        }
+        
+        // Get user salt or create a new one
+        let salt = await kvStore.get(`user:${username}:salt`);
+        if (!salt) {
+          salt = crypto.randomBytes(16).toString('hex');
+          await kvStore.set(`user:${username}:salt`, salt);
+        }
+        
+        // Get stored vault if exists
+        let vault = await kvStore.get(`user:${username}:vault`);
+        
+        // If no vault, create empty one
+        if (!vault) {
+          const emptyVault = {};
+          vault = encrypt(emptyVault, masterPassword, salt);
+          await kvStore.set(`user:${username}:vault`, vault);
+        }
+        
+        // Create a JWT token
+        const token = generateToken(username);
+        
+        // Return success with auth token
+        return {
+          statusCode: 200,
+          headers: {
+            ...headers,
+            'Set-Cookie': cookie.serialize('token', token, {
+              httpOnly: true,
+              secure: process.env.NODE_ENV === 'production',
+              sameSite: 'strict',
+              maxAge: 3600,
+              path: '/'
+            })
+          },
+          body: JSON.stringify({ success: true, token })
+        };
+      }
+      
+      case 'vault': {
+        // Get user from auth token
+        const user = getAuthUser(event);
+        
+        if (!user) {
+          return { statusCode: 401, body: JSON.stringify({ error: 'Unauthorized' }), headers };
+        }
+        
+        const username = user.sub;
+        
+        // Get user's salt
+        const salt = await kvStore.get(`user:${username}:salt`);
+        if (!salt) {
+          return { statusCode: 404, body: JSON.stringify({ error: 'User not found' }), headers };
+        }
+        
+        // Get encrypted vault
+        const encryptedVault = await kvStore.get(`user:${username}:vault`);
+        if (!encryptedVault) {
+          return { statusCode: 404, body: JSON.stringify({ error: 'Vault not found' }), headers };
+        }
+        
+        if (event.httpMethod === 'GET') {
+          // We don't return the actual vault here, just metadata
+          return {
+            statusCode: 200,
+            body: JSON.stringify({
+              username,
+              hasVault: true,
+              lastModified: await kvStore.get(`user:${username}:lastModified`) || null
+            }),
+            headers
+          };
+        }
+        
+        if (event.httpMethod === 'POST') {
+          const { masterPassword, operation, platform, keyName, keyValue, meta } = JSON.parse(event.body);
+          
+          if (!masterPassword) {
+            return { statusCode: 400, body: JSON.stringify({ error: 'Master password required' }), headers };
+          }
+          
+          try {
+            // Decrypt vault
+            const vault = decrypt(encryptedVault, masterPassword, salt);
+            
+            switch (operation) {
+              case 'list': {
+                // Return list of platforms and keys (without values)
+                const result = {};
+                Object.keys(vault).forEach(platform => {
+                  result[platform] = Object.keys(vault[platform] || {}).map(keyName => ({
+                    name: keyName,
+                    added: vault[platform][keyName].added,
+                    meta: vault[platform][keyName].meta
+                  }));
+                });
+                
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify(result),
+                  headers
+                };
+              }
+              
+              case 'get': {
+                if (!platform || !keyName) {
+                  return { statusCode: 400, body: JSON.stringify({ error: 'Platform and key name required' }), headers };
+                }
+                
+                const platformData = vault[platform] || {};
+                const keyData = platformData[keyName];
+                
+                if (!keyData) {
+                  return { statusCode: 404, body: JSON.stringify({ error: 'Key not found' }), headers };
+                }
+                
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify(keyData),
+                  headers
+                };
+              }
+              
+              case 'add': {
+                if (!platform || !keyName || !keyValue) {
+                  return { statusCode: 400, body: JSON.stringify({ error: 'Platform, key name, and value required' }), headers };
+                }
+                
+                // Initialize platform if not exists
+                if (!vault[platform]) {
+                  vault[platform] = {};
+                }
+                
+                // Add key
+                vault[platform][keyName] = {
+                  value: keyValue,
+                  added: new Date().toISOString(),
+                  meta: meta || {}
+                };
+                
+                // Encrypt and save vault
+                const updatedVault = encrypt(vault, masterPassword, salt);
+                await kvStore.set(`user:${username}:vault`, updatedVault);
+                await kvStore.set(`user:${username}:lastModified`, new Date().toISOString());
+                
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({ success: true }),
+                  headers
+                };
+              }
+              
+              case 'remove': {
+                if (!platform || !keyName) {
+                  return { statusCode: 400, body: JSON.stringify({ error: 'Platform and key name required' }), headers };
+                }
+                
+                if (!vault[platform] || !vault[platform][keyName]) {
+                  return { statusCode: 404, body: JSON.stringify({ error: 'Key not found' }), headers };
+                }
+                
+                // Remove key
+                delete vault[platform][keyName];
+                
+                // Remove platform if empty
+                if (Object.keys(vault[platform]).length === 0) {
+                  delete vault[platform];
+                }
+                
+                // Encrypt and save vault
+                const updatedVault = encrypt(vault, masterPassword, salt);
+                await kvStore.set(`user:${username}:vault`, updatedVault);
+                await kvStore.set(`user:${username}:lastModified`, new Date().toISOString());
+                
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({ success: true }),
+                  headers
+                };
+              }
+              
+              default:
+                return { statusCode: 400, body: JSON.stringify({ error: 'Invalid operation' }), headers };
+            }
+          } catch (err) {
+            // Most likely wrong password
+            return { statusCode: 401, body: JSON.stringify({ error: 'Invalid master password' }), headers };
+          }
+        }
+        
+        return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }), headers };
+      }
+      
+      case 'logout': {
+        return {
+          statusCode: 200,
+          headers: {
+            ...headers,
+            'Set-Cookie': cookie.serialize('token', '', {
+              httpOnly: true,
+              secure: process.env.NODE_ENV === 'production',
+              sameSite: 'strict',
+              maxAge: 0,
+              path: '/'
+            })
+          },
+          body: JSON.stringify({ success: true })
+        };
+      }
+      
+      default:
+        return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }), headers };
+    }
+  } catch (err) {
+    console.error('Error:', err);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: 'Internal server error' }),
+      headers
+    };
+  }
+};
