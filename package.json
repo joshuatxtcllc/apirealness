@@ -2,16 +2,15 @@
   "name": "api-keymaster",
   "version": "1.0.0",
   "description": "Secure API key management deployed on Netlify",
+  "main": "index.js",
   "scripts": {
-    "build": "mkdir -p public && cp -r src/* public/ || true"
+    "start": "node index.js",
+    "build": "echo 'No build step needed'"
   },
   "dependencies": {
     "@netlify/functions": "^1.6.0",
     "cookie": "^0.5.0",
-    "jsonwebtoken": "^9.0.1",
-    "node-fetch": "^3.3.2"
-  },
-  "devDependencies": {
-    "netlify-cli": "^15.9.1"
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.1"
   }
 }
