@@ -1,0 +1,291 @@
+// api-keymaster-secure-vault
+// A secure API key management tool for seamless platform integration
+
+// Core structure for the application
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const readline = require('readline');
+const { execSync } = require('child_process');
+
+class ApiKeymaster {
+  constructor(options = {}) {
+    this.vaultPath = options.vaultPath || path.join(process.env.HOME, '.api-keymaster');
+    this.vaultFile = path.join(this.vaultPath, 'vault.enc');
+    this.configFile = path.join(this.vaultPath, 'config.json');
+    this.masterPassword = null;
+    this.vault = {};
+    this.algorithm = 'aes-256-gcm';
+    this.initialized = false;
+  }
+
+  // Initialize the vault
+  async init() {
+    if (!fs.existsSync(this.vaultPath)) {
+      fs.mkdirSync(this.vaultPath, { recursive: true, mode: 0o700 });
+      console.log(`Created vault directory at ${this.vaultPath}`);
+    }
+
+    // Create config if it doesn't exist
+    if (!fs.existsSync(this.configFile)) {
+      const defaultConfig = {
+        version: '1.0.0',
+        lastAccess: new Date().toISOString(),
+        platforms: {
+          github: { name: 'GitHub', urlPattern: 'github.com', envVar: 'GITHUB_TOKEN' },
+          replit: { name: 'Replit', urlPattern: 'replit.com', envVar: 'REPLIT_TOKEN' },
+          netlify: { name: 'Netlify', urlPattern: 'netlify.com', envVar: 'NETLIFY_AUTH_TOKEN' }
+        }
+      };
+      fs.writeFileSync(this.configFile, JSON.stringify(defaultConfig, null, 2), { mode: 0o600 });
+    }
+
+    // Prompt for master password if vault exists, otherwise create new vault
+    if (fs.existsSync(this.vaultFile)) {
+      await this.unlockVault();
+    } else {
+      await this.createVault();
+    }
+
+    this.initialized = true;
+    return this;
+  }
+
+  // Create a new vault with a master password
+  async createVault() {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise((resolve, reject) => {
+      rl.question('Create a master password for your vault: ', async (password) => {
+        rl.close();
+        if (!password || password.length < 8) {
+          console.error('Password must be at least 8 characters');
+          return reject(new Error('Password too short'));
+        }
+
+        this.masterPassword = password;
+        this.vault = {}; // Empty vault initially
+        
+        try {
+          await this.saveVault();
+          console.log('Vault created successfully!');
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  }
+
+  // Unlock an existing vault
+  async unlockVault() {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise((resolve, reject) => {
+      rl.question('Enter your vault master password: ', async (password) => {
+        rl.close();
+        this.masterPassword = password;
+        
+        try {
+          const encryptedData = fs.readFileSync(this.vaultFile);
+          const [iv, authTag, encryptedVault] = this.parseEncryptedData(encryptedData);
+          
+          const decipher = crypto.createDecipheriv(
+            this.algorithm,
+            this.deriveKey(),
+            iv
+          );
+          decipher.setAuthTag(authTag);
+          
+          let decrypted = decipher.update(encryptedVault, null, 'utf8');
+          decrypted += decipher.final('utf8');
+          
+          this.vault = JSON.parse(decrypted);
+          console.log('Vault unlocked successfully!');
+          resolve();
+        } catch (err) {
+          console.error('Failed to unlock vault. Incorrect password?');
+          reject(err);
+        }
+      });
+    });
+  }
+
+  // Save the vault with encryption
+  async saveVault() {
+    const key = this.deriveKey();
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(this.algorithm, key, iv);
+    
+    const jsonData = JSON.stringify(this.vault);
+    let encrypted = cipher.update(jsonData, 'utf8');
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    
+    const authTag = cipher.getAuthTag();
+    
+    // Store as IV + AuthTag + EncryptedData
+    const dataToStore = Buffer.concat([
+      iv,
+      authTag,
+      encrypted
+    ]);
+    
+    fs.writeFileSync(this.vaultFile, dataToStore, { mode: 0o600 });
+    return true;
+  }
+
+  // Parse the encrypted data file
+  parseEncryptedData(data) {
+    const iv = data.slice(0, 16);
+    const authTag = data.slice(16, 32);
+    const encryptedVault = data.slice(32);
+    return [iv, authTag, encryptedVault];
+  }
+
+  // Derive encryption key from master password
+  deriveKey() {
+    return crypto.scryptSync(this.masterPassword, 'api-keymaster-salt', 32);
+  }
+
+  // Add a new API key to the vault
+  async addKey(platform, keyName, keyValue, meta = {}) {
+    if (!this.initialized) {
+      throw new Error('Vault not initialized');
+    }
+    
+    if (!this.vault[platform]) {
+      this.vault[platform] = {};
+    }
+    
+    this.vault[platform][keyName] = {
+      value: keyValue,
+      added: new Date().toISOString(),
+      meta
+    };
+    
+    await this.saveVault();
+    console.log(`Added key "${keyName}" for ${platform}`);
+    return true;
+  }
+
+  // Get an API key from the vault
+  getKey(platform, keyName) {
+    if (!this.initialized) {
+      throw new Error('Vault not initialized');
+    }
+    
+    if (!this.vault[platform] || !this.vault[platform][keyName]) {
+      return null;
+    }
+    
+    return this.vault[platform][keyName].value;
+  }
+
+  // List all platforms and keys (without values)
+  listKeys() {
+    if (!this.initialized) {
+      throw new Error('Vault not initialized');
+    }
+    
+    const result = {};
+    
+    Object.keys(this.vault).forEach(platform => {
+      result[platform] = Object.keys(this.vault[platform]).map(keyName => ({
+        name: keyName,
+        added: this.vault[platform][keyName].added,
+        meta: this.vault[platform][keyName].meta
+      }));
+    });
+    
+    return result;
+  }
+
+  // Execute a command with environment variables set from the vault
+  async execWithKeys(platform, command) {
+    if (!this.initialized) {
+      throw new Error('Vault not initialized');
+    }
+    
+    if (!this.vault[platform]) {
+      throw new Error(`No keys found for platform: ${platform}`);
+    }
+    
+    const config = JSON.parse(fs.readFileSync(this.configFile));
+    const platformConfig = config.platforms[platform];
+    
+    if (!platformConfig) {
+      throw new Error(`Platform ${platform} not configured`);
+    }
+    
+    const env = { ...process.env };
+    
+    // Set environment variables for each key
+    Object.keys(this.vault[platform]).forEach(keyName => {
+      const keyValue = this.vault[platform][keyName].value;
+      const envVarName = platformConfig.envVar || `${platform.toUpperCase()}_${keyName.toUpperCase()}`;
+      env[envVarName] = keyValue;
+    });
+    
+    try {
+      const output = execSync(command, { env, stdio: 'inherit' });
+      return output ? output.toString() : null;
+    } catch (err) {
+      console.error(`Command execution failed: ${err.message}`);
+      throw err;
+    }
+  }
+  
+  // Generate shell export commands for platform keys
+  exportForShell(platform) {
+    if (!this.initialized) {
+      throw new Error('Vault not initialized');
+    }
+    
+    if (!this.vault[platform]) {
+      throw new Error(`No keys found for platform: ${platform}`);
+    }
+    
+    const config = JSON.parse(fs.readFileSync(this.configFile));
+    const platformConfig = config.platforms[platform];
+    
+    let exportCommands = '';
+    
+    Object.keys(this.vault[platform]).forEach(keyName => {
+      const keyValue = this.vault[platform][keyName].value;
+      const envVarName = platformConfig?.envVar || `${platform.toUpperCase()}_${keyName.toUpperCase()}`;
+      exportCommands += `export ${envVarName}="${keyValue}"\n`;
+    });
+    
+    return exportCommands;
+  }
+
+  // Remove a key from the vault
+  async removeKey(platform, keyName) {
+    if (!this.initialized) {
+      throw new Error('Vault not initialized');
+    }
+    
+    if (!this.vault[platform] || !this.vault[platform][keyName]) {
+      throw new Error(`Key not found: ${platform}/${keyName}`);
+    }
+    
+    delete this.vault[platform][keyName];
+    
+    // Remove platform if no keys left
+    if (Object.keys(this.vault[platform]).length === 0) {
+      delete this.vault[platform];
+    }
+    
+    await this.saveVault();
+    console.log(`Removed key "${keyName}" from ${platform}`);
+    return true;
+  }
+}
+
+module.exports = ApiKeymaster;
