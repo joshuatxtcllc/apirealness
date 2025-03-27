@@ -1,0 +1,136 @@
+# API Keymaster - Netlify Deployment Guide
+
+This guide will walk you through deploying the API Keymaster application to Netlify.
+
+## Prerequisites
+
+- [GitHub](https://github.com/) account
+- [Netlify](https://netlify.com/) account
+- [Node.js](https://nodejs.org/) installed on your local machine
+
+## Step 1: Create a GitHub Repository
+
+1. Create a new repository on GitHub
+2. Clone the repository to your local machine
+3. Copy all the files from this project into your repository
+
+## Step 2: Set Up the Project Structure
+
+Ensure your project has the following structure:
+
+```
+api-keymaster/
+├── netlify.toml
+├── package.json
+├── netlify/
+│   └── functions/
+│       └── api-keymaster.js
+├── public/
+│   └── index.html
+└── src/
+    └── (put additional static assets here)
+```
+
+## Step 3: Install Dependencies
+
+Run the following command in your project directory:
+
+```bash
+npm install
+```
+
+This will install all the required dependencies for your project.
+
+## Step 4: Test Locally with Netlify Dev
+
+1. Install the Netlify CLI if you haven't already:
+
+```bash
+npm install -g netlify-cli
+```
+
+2. Start the development server:
+
+```bash
+netlify dev
+```
+
+3. Open your browser and navigate to `http://localhost:8888` to test your application locally.
+
+## Step 5: Deploy to Netlify
+
+### Option 1: Automated Deployment (Recommended)
+
+1. Push your code to GitHub:
+
+```bash
+git add .
+git commit -m "Initial commit"
+git push origin main
+```
+
+2. Log in to your Netlify account
+3. Click "New site from Git"
+4. Choose GitHub as your Git provider
+5. Select your repository
+6. Configure build settings:
+   - Build command: `npm run build`
+   - Publish directory: `public`
+7. Click "Deploy site"
+
+### Option 2: Manual Deployment
+
+1. Build your site:
+
+```bash
+npm run build
+```
+
+2. Deploy using the Netlify CLI:
+
+```bash
+netlify deploy --prod
+```
+
+## Step 6: Configure Environment Variables
+
+For production, you should set the following environment variables in the Netlify dashboard:
+
+1. Go to Site settings > Build & deploy > Environment
+2. Add the following variables:
+   - `JWT_SECRET`: A secure random string for JWT token signing
+   - `NODE_ENV`: Set to `production`
+
+## Step 7: Set Up Custom Domain (Optional)
+
+1. In the Netlify dashboard, go to Site settings > Domain management
+2. Click "Add custom domain"
+3. Follow the instructions to set up your domain
+
+## Usage
+
+Once deployed, your API Keymaster application will be available at your Netlify domain. Users can:
+
+1. Create an account with a username and master password
+2. Add API keys for different platforms
+3. View, copy, and manage their keys securely
+4. Use the keys in their projects by copying them or using environment variables
+
+## Security Considerations
+
+- All API keys are encrypted using AES-256-GCM
+- Keys are only decrypted with the user's master password
+- The master password is never stored on the server
+- The application uses JWTs for session management
+- All data is stored in Netlify's Key-Value store, not in the code repository
+
+## Troubleshooting
+
+If you encounter any issues during deployment:
+
+1. Check the Netlify deploy logs
+2. Make sure all required environment variables are set
+3. Verify your project structure matches the recommended layout
+4. Test locally with `netlify dev` to identify any issues
+
+For more information about Netlify Functions, refer to the [Netlify Functions documentation](https://docs.netlify.com/functions/overview/).
