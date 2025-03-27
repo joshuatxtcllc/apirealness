@@ -1,0 +1,235 @@
+#!/usr/bin/env node
+
+// api-keymaster-cli
+// CLI interface for the API Keymaster secure vault
+
+const ApiKeymaster = require('./api-keymaster-secure-vault');
+const yargs = require('yargs/yargs');
+const { hideBin } = require('yargs/helpers');
+const chalk = require('chalk');
+const boxen = require('boxen');
+const clipboardy = require('clipboardy');
+
+async function main() {
+  const keymaster = new ApiKeymaster();
+  
+  // Define CLI commands
+  const argv = yargs(hideBin(process.argv))
+    .usage('$0 <command> [options]')
+    .command('init', 'Initialize or unlock the vault', {}, async () => {
+      try {
+        await keymaster.init();
+        console.log(chalk.green('✓ Vault is ready to use'));
+      } catch (err) {
+        console.error(chalk.red(`Error: ${err.message}`));
+        process.exit(1);
+      }
+    })
+    .command('add <platform> <name> <value>', 'Add a new API key to the vault', 
+      (yargs) => {
+        return yargs
+          .positional('platform', {
+            describe: 'Platform name (e.g., github, replit, netlify)',
+            type: 'string'
+          })
+          .positional('name', {
+            describe: 'Name for this key',
+            type: 'string'
+          })
+          .positional('value', {
+            describe: 'Secret API key value',
+            type: 'string'
+          })
+          .option('description', {
+            alias: 'd',
+            describe: 'Add a description for this key',
+            type: 'string'
+          });
+      }, 
+      async (argv) => {
+        try {
+          await keymaster.init();
+          await keymaster.addKey(argv.platform, argv.name, argv.value, {
+            description: argv.description || ''
+          });
+          console.log(chalk.green(`✓ Added key "${argv.name}" to ${argv.platform}`));
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+      }
+    )
+    .command('get <platform> <name>', 'Retrieve an API key', 
+      (yargs) => {
+        return yargs
+          .positional('platform', {
+            describe: 'Platform name',
+            type: 'string'
+          })
+          .positional('name', {
+            describe: 'Key name',
+            type: 'string'
+          })
+          .option('copy', {
+            alias: 'c',
+            describe: 'Copy to clipboard',
+            type: 'boolean',
+            default: false
+          });
+      }, 
+      async (argv) => {
+        try {
+          await keymaster.init();
+          const keyValue = keymaster.getKey(argv.platform, argv.name);
+          
+          if (!keyValue) {
+            console.error(chalk.red(`Key not found: ${argv.platform}/${argv.name}`));
+            process.exit(1);
+          }
+          
+          if (argv.copy) {
+            await clipboardy.write(keyValue);
+            console.log(chalk.green('✓ Key copied to clipboard'));
+          } else {
+            const output = boxen(keyValue, {
+              padding: 1,
+              margin: 1,
+              borderStyle: 'round',
+              borderColor: 'green',
+              title: `${argv.platform}/${argv.name}`
+            });
+            console.log(output);
+          }
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+      }
+    )
+    .command('list', 'List all stored keys (without values)', 
+      {}, 
+      async () => {
+        try {
+          await keymaster.init();
+          const keys = keymaster.listKeys();
+          
+          if (Object.keys(keys).length === 0) {
+            console.log(chalk.yellow('No keys stored in the vault'));
+            return;
+          }
+          
+          console.log(chalk.bold('\nStored API Keys:'));
+          
+          Object.keys(keys).forEach(platform => {
+            console.log(chalk.cyan(`\n${platform}:`));
+            
+            if (keys[platform].length === 0) {
+              console.log('  No keys');
+              return;
+            }
+            
+            keys[platform].forEach(key => {
+              const date = new Date(key.added).toLocaleDateString();
+              const desc = key.meta.description ? 
+                ` - ${chalk.italic(key.meta.description)}` : '';
+              
+              console.log(`  ${chalk.green('•')} ${key.name} ${chalk.dim(`(added ${date})`)}${desc}`);
+            });
+          });
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+      }
+    )
+    .command('exec <platform> <command>', 'Execute a command with platform keys as environment variables', 
+      (yargs) => {
+        return yargs
+          .positional('platform', {
+            describe: 'Platform name',
+            type: 'string'
+          })
+          .positional('command', {
+            describe: 'Command to execute',
+            type: 'string'
+          });
+      }, 
+      async (argv) => {
+        try {
+          await keymaster.init();
+          console.log(chalk.cyan(`Executing with ${argv.platform} keys: ${argv.command}`));
+          await keymaster.execWithKeys(argv.platform, argv.command);
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+      }
+    )
+    .command('export <platform>', 'Generate shell export commands for platform keys', 
+      (yargs) => {
+        return yargs
+          .positional('platform', {
+            describe: 'Platform name',
+            type: 'string'
+          })
+          .option('copy', {
+            alias: 'c',
+            describe: 'Copy to clipboard',
+            type: 'boolean',
+            default: false
+          });
+      }, 
+      async (argv) => {
+        try {
+          await keymaster.init();
+          const exportCommands = keymaster.exportForShell(argv.platform);
+          
+          if (argv.copy) {
+            await clipboardy.write(exportCommands);
+            console.log(chalk.green(`✓ ${argv.platform} export commands copied to clipboard`));
+          } else {
+            console.log(chalk.cyan(`\nExport commands for ${argv.platform}:`));
+            console.log(exportCommands);
+          }
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+      }
+    )
+    .command('remove <platform> <name>', 'Remove an API key from the vault', 
+      (yargs) => {
+        return yargs
+          .positional('platform', {
+            describe: 'Platform name',
+            type: 'string'
+          })
+          .positional('name', {
+            describe: 'Key name',
+            type: 'string'
+          });
+      }, 
+      async (argv) => {
+        try {
+          await keymaster.init();
+          await keymaster.removeKey(argv.platform, argv.name);
+          console.log(chalk.green(`✓ Removed key "${argv.name}" from ${argv.platform}`));
+        } catch (err) {
+          console.error(chalk.red(`Error: ${err.message}`));
+          process.exit(1);
+        }
+      }
+    )
+    .demandCommand(1, 'You need to specify a command')
+    .help()
+    .alias('h', 'help')
+    .version()
+    .alias('v', 'version')
+    .epilogue('For more information, check the GitHub repository')
+    .argv;
+}
+
+main().catch(err => {
+  console.error(chalk.red(`Fatal error: ${err.message}`));
+  process.exit(1);
+});
